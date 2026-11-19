@@ -4,3 +4,27 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
+
+flume = "0.12.0"
+futures-util = "0.3.32"
+
+yellowstone-grpc-client = "17.0.0"
+yellowstone-grpc-proto = "14.0.1"
+tonic = { version = "0.14.6", features = ["tls-ring"] }
+
+lastbuy-sdk = { version = "0.3.1", default-features = false, features = ["events", "parse-events", "instructions"] }
+
+solana-pubkey = { version = "4.4.0", features = ["borsh"] }
+solana-signature = "3.6.0"
+solana-rpc-client = "4.3.0"
+solana-transaction = { version = "4.3.0", features = ["wincode"] }
+solana-message = "4.3.0"
+solana-keypair = "3.0.1"
+spl-associated-token-account-interface = "2.0.0"
+
+dotenvy = "0.15.7"
+env_logger = "0.11.11"
+log = "0.4.34"
+
+thiserror = "2.0.21"
