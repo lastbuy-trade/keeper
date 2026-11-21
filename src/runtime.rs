@@ -3,7 +3,7 @@ use crate::{
     chain,
     config::Config,
     coordinator::{Coordinator, StepResult},
-    ledger::Ledger,
+    ledger::{Ledger, LedgerError},
     monitor::{self, MonitorConfig, MonitorEvent},
     pipeline::ValidatedPolicy,
     reconcile,
@@ -31,7 +31,7 @@ enum ExecutionCommand {
     Exhausted {
         curve: String,
         failures: u8,
-        persisted: tokio::sync::oneshot::Sender<Result<(), String>>,
+        persisted: tokio::sync::oneshot::Sender<Result<(), LedgerError>>,
     },
 }
 
@@ -187,7 +187,7 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
                             }
                         }
                         ExecutionCommand::Exhausted { curve, failures, persisted } => {
-                            let result = coordinator.mark_curve_exhausted(curve, failures).map_err(|error| error.to_string());
+                            let result = coordinator.mark_curve_exhausted(curve, failures);
                             let _ = persisted.send(result);
                         }
                     }

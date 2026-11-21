@@ -8,7 +8,7 @@ use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use tokio::sync::watch;
 
 use crate::{
-    ledger::Ledger,
+    ledger::{Ledger, LedgerError, Record},
     pipeline::{self, PipelineError, ValidatedPolicy},
     scheduler::Candidate,
     submission::{self, RecoveryResult, SubmissionError},
@@ -78,9 +78,9 @@ impl<'a> Coordinator<'a> {
         &mut self,
         curve: String,
         failures: u8,
-    ) -> Result<(), crate::ledger::LedgerError> {
+    ) -> Result<(), LedgerError> {
         self.ledger
-            .append(crate::ledger::Record::CurveExhausted { curve, failures })
+            .append(Record::CurveExhausted { curve, failures })
     }
 
     /// Successful finalized migrations, including legacy settlement-only journal entries.
@@ -211,7 +211,7 @@ impl<'a> Coordinator<'a> {
         };
         if current.is_none() {
             self.ledger
-                .append(crate::ledger::Record::FinalizedOutcome {
+                .append(Record::FinalizedOutcome {
                     signature: signature.clone(),
                     success: settlement.outcome != crate::accounting::Outcome::Failure,
                     slot: settlement.slot,
@@ -219,7 +219,7 @@ impl<'a> Coordinator<'a> {
                 .map_err(SubmissionError::from)?;
         }
         self.ledger
-            .append(crate::ledger::Record::FinalizedSettlement { settlement })
+            .append(Record::FinalizedSettlement { settlement })
             .map_err(SubmissionError::from)?;
         self.log_settlement(signature, RecoveryResult::Settled);
         Ok(Some(RecoveryResult::Settled))

@@ -15,8 +15,64 @@ pub enum LedgerError {
     Io(#[from] io::Error),
     #[error("invalid ledger JSON: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("invalid ledger: {0}")]
-    Invalid(String),
+    #[error("invalid ledger: sequence overflow")]
+    SequenceOverflow,
+    #[error("invalid ledger: non-contiguous sequence")]
+    NonContiguousSequence,
+    #[error("invalid ledger: invalid header or unsupported schema")]
+    InvalidHeader,
+    #[error("invalid ledger: invalid attempt identity or bytes")]
+    InvalidAttempt,
+    #[error("invalid ledger: conflicting signed attempt")]
+    ConflictingSignedAttempt,
+    #[error("invalid ledger: attempt protocol cannot be upgraded or duplicated")]
+    AttemptProtocolConflict,
+    #[error("invalid ledger: invalid validated attempt or evidence")]
+    InvalidValidatedAttempt,
+    #[error("invalid ledger: conflicting validated attempt")]
+    ConflictingValidatedAttempt,
+    #[error("invalid ledger: invalid send intent")]
+    InvalidSendIntent,
+    #[error("invalid ledger: invalid never-submitted resolution")]
+    InvalidNeverSubmitted,
+    #[error("invalid ledger: invalid unresolved expiration")]
+    InvalidUnresolvedExpiration,
+    #[error("invalid ledger: observation for unknown signature")]
+    UnknownObservationSignature,
+    #[error("invalid ledger: invalid expiration")]
+    InvalidExpiration,
+    #[error("invalid ledger: invalid exhausted curve record")]
+    InvalidExhaustedCurve,
+    #[error("invalid ledger: invalid finalized outcome")]
+    InvalidFinalizedOutcome,
+    #[error("invalid ledger: outcome conflicts with settlement")]
+    OutcomeSettlementConflict,
+    #[error("invalid ledger: conflicting finalized outcome")]
+    ConflictingFinalizedOutcome,
+    #[error("invalid ledger: settlement for expired attempt")]
+    SettlementForExpiredAttempt,
+    #[error("invalid ledger: settlement for unknown signature")]
+    SettlementForUnknownSignature,
+    #[error("invalid ledger: settlement conflicts with finalized outcome")]
+    SettlementOutcomeConflict,
+    #[error("invalid ledger: invalid settlement")]
+    InvalidSettlement,
+    #[error("invalid ledger: conflicting settlement")]
+    ConflictingSettlement,
+    #[error("invalid ledger: ledger offset overflow")]
+    OffsetOverflow,
+    #[error("invalid ledger: missing ledger header")]
+    MissingHeader,
+    #[error("invalid ledger: state directory path is not a directory")]
+    StatePathNotDirectory,
+    #[error("invalid ledger: cannot acquire exclusive ledger lock: {0}")]
+    Lock(#[source] std::fs::TryLockError),
+    #[error("invalid ledger: tail backup counter overflow")]
+    TailBackupCounterOverflow,
+    #[error("invalid ledger: ledger identity does not match genesis hash and payer")]
+    IdentityMismatch,
+    #[error("invalid ledger: ledger write failed; reopen and recover before writing")]
+    Poisoned,
     #[error("ledger accounting: {0}")]
     Accounting(#[from] AccountingError),
 }
@@ -210,9 +266,9 @@ impl Replay {
             != self
                 .last_sequence
                 .checked_add(1)
-                .ok_or_else(|| LedgerError::Invalid("sequence overflow".into()))?
+                .ok_or(LedgerError::SequenceOverflow)?
         {
-            return Err(LedgerError::Invalid("non-contiguous sequence".into()));
+            return Err(LedgerError::NonContiguousSequence);
         }
         let intent_protocol_record =
             matches!(&line.record, Record::PolicyValidatedAttemptV2 { .. });
@@ -230,9 +286,7 @@ impl Replay {
                 self.payer = payer;
             }
             Record::Header { .. } => {
-                return Err(LedgerError::Invalid(
-                    "invalid header or unsupported schema".into(),
-                ));
+                return Err(LedgerError::InvalidHeader);
             }
             Record::SignedAttempt { attempt } => {
                 if self.genesis_hash.is_empty()
@@ -242,13 +296,11 @@ impl Replay {
                     || attempt.curve.is_empty()
                     || attempt.signed_bytes.is_empty()
                 {
-                    return Err(LedgerError::Invalid(
-                        "invalid attempt identity or bytes".into(),
-                    ));
+                    return Err(LedgerError::InvalidAttempt);
                 }
                 if let Some(previous) = self.attempts.get(&attempt.signature) {
                     if previous != &attempt {
-                        return Err(LedgerError::Invalid("conflicting signed attempt".into()));
+                        return Err(LedgerError::ConflictingSignedAttempt);
                     }
                 } else {
                     self.attempts.insert(attempt.signature.clone(), attempt);
@@ -257,9 +309,7 @@ impl Replay {
             Record::PolicyValidatedAttemptV2 { ref attempt, .. }
                 if self.attempts.contains_key(&attempt.signature) =>
             {
-                return Err(LedgerError::Invalid(
-                    "attempt protocol cannot be upgraded or duplicated".into(),
-                ));
+                return Err(LedgerError::AttemptProtocolConflict);
             }
             Record::PolicyValidatedAttempt { attempt, evidence }
             | Record::PolicyValidatedAttemptV2 { attempt, evidence } => {
@@ -271,9 +321,7 @@ impl Replay {
                     || attempt.curve.is_empty()
                     || attempt.signed_bytes.is_empty()
                 {
-                    return Err(LedgerError::Invalid(
-                        "invalid validated attempt or evidence".into(),
-                    ));
+                    return Err(LedgerError::InvalidValidatedAttempt);
                 }
                 if self
                     .attempts
@@ -284,7 +332,7 @@ impl Replay {
                         .get(&attempt.signature)
                         .is_some_and(|prior| prior != &evidence)
                 {
-                    return Err(LedgerError::Invalid("conflicting validated attempt".into()));
+                    return Err(LedgerError::ConflictingValidatedAttempt);
                 }
                 let signature = attempt.signature.clone();
                 self.attempts.insert(signature.clone(), attempt);
@@ -300,7 +348,7 @@ impl Replay {
                     || self.finalized_outcomes.contains_key(&signature)
                     || self.expired.contains_key(&signature)
                 {
-                    return Err(LedgerError::Invalid("invalid send intent".into()));
+                    return Err(LedgerError::InvalidSendIntent);
                 }
                 self.send_intents.insert(signature);
             }
@@ -311,9 +359,7 @@ impl Replay {
                     || self.finalized_outcomes.contains_key(&signature)
                     || self.expired.contains_key(&signature)
                 {
-                    return Err(LedgerError::Invalid(
-                        "invalid never-submitted resolution".into(),
-                    ));
+                    return Err(LedgerError::InvalidNeverSubmitted);
                 }
                 self.never_submitted.insert(signature);
             }
@@ -328,15 +374,13 @@ impl Replay {
                     || self.expired.contains_key(&signature)
                     || self.expired_unresolved.contains_key(&signature)
                 {
-                    return Err(LedgerError::Invalid("invalid unresolved expiration".into()));
+                    return Err(LedgerError::InvalidUnresolvedExpiration);
                 }
                 self.expired_unresolved.insert(signature, finalized_slot);
             }
             Record::SubmissionObservation { signature, .. } => {
                 if !self.attempts.contains_key(&signature) {
-                    return Err(LedgerError::Invalid(
-                        "observation for unknown signature".into(),
-                    ));
+                    return Err(LedgerError::UnknownObservationSignature);
                 }
             }
             Record::Expired { signature } => {
@@ -345,15 +389,13 @@ impl Replay {
                     || self.finalized_outcomes.contains_key(&signature)
                     || self.never_submitted.contains(&signature)
                 {
-                    return Err(LedgerError::Invalid("invalid expiration".into()));
+                    return Err(LedgerError::InvalidExpiration);
                 }
                 self.expired.insert(signature, true);
             }
             Record::CurveExhausted { curve, failures } => {
                 if curve.is_empty() || failures == 0 {
-                    return Err(LedgerError::Invalid(
-                        "invalid exhausted curve record".into(),
-                    ));
+                    return Err(LedgerError::InvalidExhaustedCurve);
                 }
                 self.exhausted_curves.insert(curve);
             }
@@ -366,19 +408,17 @@ impl Replay {
                     || self.expired.contains_key(&signature)
                     || self.never_submitted.contains(&signature)
                 {
-                    return Err(LedgerError::Invalid("invalid finalized outcome".into()));
+                    return Err(LedgerError::InvalidFinalizedOutcome);
                 }
                 if let Some(settlement) = self.settlements.get(&signature)
                     && (settlement.slot != slot
                         || (settlement.outcome != Outcome::Failure) != success)
                 {
-                    return Err(LedgerError::Invalid(
-                        "outcome conflicts with settlement".into(),
-                    ));
+                    return Err(LedgerError::OutcomeSettlementConflict);
                 }
                 if let Some(previous) = self.finalized_outcomes.get(&signature) {
                     if *previous != (success, slot) {
-                        return Err(LedgerError::Invalid("conflicting finalized outcome".into()));
+                        return Err(LedgerError::ConflictingFinalizedOutcome);
                     }
                 } else {
                     self.finalized_outcomes.insert(signature, (success, slot));
@@ -388,20 +428,17 @@ impl Replay {
                 if self.expired.contains_key(&settlement.signature)
                     || self.never_submitted.contains(&settlement.signature)
                 {
-                    return Err(LedgerError::Invalid(
-                        "settlement for expired attempt".into(),
-                    ));
+                    return Err(LedgerError::SettlementForExpiredAttempt);
                 }
-                let attempt = self.attempts.get(&settlement.signature).ok_or_else(|| {
-                    LedgerError::Invalid("settlement for unknown signature".into())
-                })?;
+                let attempt = self
+                    .attempts
+                    .get(&settlement.signature)
+                    .ok_or_else(|| LedgerError::SettlementForUnknownSignature)?;
                 if let Some((success, slot)) = self.finalized_outcomes.get(&settlement.signature)
                     && (*slot != settlement.slot
                         || *success != (settlement.outcome != Outcome::Failure))
                 {
-                    return Err(LedgerError::Invalid(
-                        "settlement conflicts with finalized outcome".into(),
-                    ));
+                    return Err(LedgerError::SettlementOutcomeConflict);
                 }
                 if settlement.curve != attempt.curve
                     || settlement.evidence.is_empty()
@@ -412,11 +449,11 @@ impl Replay {
                             0,
                         )?
                 {
-                    return Err(LedgerError::Invalid("invalid settlement".into()));
+                    return Err(LedgerError::InvalidSettlement);
                 }
                 if let Some(previous) = self.settlements.get(&settlement.signature) {
                     if previous != &settlement {
-                        return Err(LedgerError::Invalid("conflicting settlement".into()));
+                        return Err(LedgerError::ConflictingSettlement);
                     }
                 } else {
                     self.totals.add(
@@ -457,7 +494,7 @@ fn read_prefix(file: &mut File) -> Result<(Replay, u64, Vec<u8>), LedgerError> {
         replay.apply(parsed)?;
         offset = offset
             .checked_add(line.len() as u64)
-            .ok_or_else(|| LedgerError::Invalid("ledger offset overflow".into()))?;
+            .ok_or(LedgerError::OffsetOverflow)?;
     }
 }
 /// Read a consistent newline-terminated prefix without taking the writer lock.
@@ -465,7 +502,7 @@ pub fn read_summary(path: &Path) -> Result<Replay, LedgerError> {
     let mut file = File::open(path)?;
     let (replay, _, _) = read_prefix(&mut file)?;
     if replay.last_sequence == 0 {
-        return Err(LedgerError::Invalid("missing ledger header".into()));
+        return Err(LedgerError::MissingHeader);
     }
     Ok(replay)
 }
@@ -476,9 +513,7 @@ pub fn reset(state_dir: &Path) -> Result<bool, LedgerError> {
     match fs::metadata(state_dir) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => {
-            return Err(LedgerError::Invalid(
-                "state directory path is not a directory".into(),
-            ));
+            return Err(LedgerError::StatePathNotDirectory);
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
@@ -502,8 +537,7 @@ fn acquire_lock(state_dir: &Path) -> Result<File, LedgerError> {
         .create(true)
         .truncate(false)
         .open(state_dir.join("ledger.lock"))?;
-    lock.try_lock()
-        .map_err(|e| LedgerError::Invalid(format!("cannot acquire exclusive ledger lock: {e}")))?;
+    lock.try_lock().map_err(LedgerError::Lock)?;
     Ok(lock)
 }
 
@@ -542,9 +576,9 @@ impl Ledger {
                         break;
                     }
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                        i = i.checked_add(1).ok_or_else(|| {
-                            LedgerError::Invalid("tail backup counter overflow".into())
-                        })?;
+                        i = i
+                            .checked_add(1)
+                            .ok_or_else(|| LedgerError::TailBackupCounterOverflow)?;
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -555,9 +589,7 @@ impl Ledger {
         if replay.last_sequence > 0
             && (replay.genesis_hash != genesis_hash || replay.payer != payer)
         {
-            return Err(LedgerError::Invalid(
-                "ledger identity does not match genesis hash and payer".into(),
-            ));
+            return Err(LedgerError::IdentityMismatch);
         }
         file.seek(SeekFrom::End(0))?;
         let mut ledger = Self {
@@ -579,15 +611,13 @@ impl Ledger {
     /// Validates and synchronizes each complete record before returning.
     pub fn append(&mut self, record: Record) -> Result<(), LedgerError> {
         if self.poisoned {
-            return Err(LedgerError::Invalid(
-                "ledger write failed; reopen and recover before writing".into(),
-            ));
+            return Err(LedgerError::Poisoned);
         }
         let sequence = self
             .replay
             .last_sequence
             .checked_add(1)
-            .ok_or_else(|| LedgerError::Invalid("sequence overflow".into()))?;
+            .ok_or(LedgerError::SequenceOverflow)?;
         let line = Line { sequence, record };
         // Replay the prospective record against an independent state before writing it.
         let mut copy = Replay {

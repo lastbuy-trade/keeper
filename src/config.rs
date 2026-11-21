@@ -44,8 +44,29 @@ pub enum ConfigError {
     Read(#[from] std::io::Error),
     #[error("invalid configuration: {0}")]
     Toml(#[from] toml::de::Error),
-    #[error("invalid configuration: {0}")]
-    Invalid(String),
+    #[error("invalid configuration: {0} is not UTF-8")]
+    EnvironmentNotUtf8(&'static str),
+    #[error("invalid configuration: invalid {0}")]
+    InvalidEnvironmentNumber(&'static str),
+    #[error(
+        "invalid configuration: {field} is required; configure keeper.secrets.toml or {environment}"
+    )]
+    MissingServiceUrl {
+        field: &'static str,
+        environment: &'static str,
+    },
+    #[error("invalid configuration: {0} must be a valid HTTP(S) URL")]
+    InvalidServiceUrl(&'static str),
+    #[error("invalid configuration: priority fee exceeds configured cap")]
+    PriorityFeeExceedsCap,
+    #[error("invalid configuration: gpa_interval_seconds must be positive")]
+    InvalidGpaInterval,
+    #[error("invalid configuration: max_curve_failures must be positive")]
+    InvalidMaxCurveFailures,
+    #[error("invalid configuration: log_format must be text or json")]
+    InvalidLogFormat,
+    #[error("invalid configuration: HOME is required for ~ expansion")]
+    HomeRequired,
 }
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -145,7 +166,7 @@ impl Config {
                 if let Some(value) = env::var_os($name) {
                     config.$field = value
                         .into_string()
-                        .map_err(|_| ConfigError::Invalid(format!("{} is not UTF-8", $name)))?
+                        .map_err(|_| ConfigError::EnvironmentNotUtf8($name))?
                         .into();
                 }
             };
@@ -156,7 +177,7 @@ impl Config {
                     config.$field = value
                         .to_str()
                         .and_then(|v| v.parse().ok())
-                        .ok_or_else(|| ConfigError::Invalid(format!("invalid {}", $name)))?;
+                        .ok_or(ConfigError::InvalidEnvironmentNumber($name))?;
                 }
             };
         }
@@ -167,12 +188,12 @@ impl Config {
             if let Some(value) = env::var_os("KEEPER_RPC_URL") {
                 config.rpc_url = value
                     .into_string()
-                    .map_err(|_| ConfigError::Invalid("KEEPER_RPC_URL is not UTF-8".into()))?;
+                    .map_err(|_| ConfigError::EnvironmentNotUtf8("KEEPER_RPC_URL"))?;
             }
             if let Some(value) = env::var_os("KEEPER_GRPC_URL") {
                 config.grpc_url = value
                     .into_string()
-                    .map_err(|_| ConfigError::Invalid("KEEPER_GRPC_URL is not UTF-8".into()))?;
+                    .map_err(|_| ConfigError::EnvironmentNotUtf8("KEEPER_GRPC_URL"))?;
             }
             string!("KEEPER_KEYPAIR_PATH", keypair_path);
             number!("KEEPER_PRIORITY_FEE_LAMPORTS", priority_fee_lamports);
@@ -204,44 +225,36 @@ impl Config {
     }
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_local()?;
-        for (name, value) in [("rpc_url", &self.rpc_url), ("grpc_url", &self.grpc_url)] {
+        for (name, environment, value) in [
+            ("rpc_url", "KEEPER_RPC_URL", &self.rpc_url),
+            ("grpc_url", "KEEPER_GRPC_URL", &self.grpc_url),
+        ] {
             if value.is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "{name} is required; configure keeper.secrets.toml or KEEPER_{}",
-                    name.to_ascii_uppercase()
-                )));
+                return Err(ConfigError::MissingServiceUrl {
+                    field: name,
+                    environment,
+                });
             }
             let value = value.as_str();
-            let url = Url::parse(value)
-                .map_err(|_| ConfigError::Invalid(format!("{name} must be a valid HTTP(S) URL")))?;
+            let url = Url::parse(value).map_err(|_| ConfigError::InvalidServiceUrl(name))?;
             if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
-                return Err(ConfigError::Invalid(format!(
-                    "{name} must be a valid HTTP(S) URL"
-                )));
+                return Err(ConfigError::InvalidServiceUrl(name));
             }
         }
         if self.priority_fee_lamports > self.max_priority_fee_lamports {
-            return Err(ConfigError::Invalid(
-                "priority fee exceeds configured cap".into(),
-            ));
+            return Err(ConfigError::PriorityFeeExceedsCap);
         }
         if self.gpa_interval_seconds == 0 {
-            return Err(ConfigError::Invalid(
-                "gpa_interval_seconds must be positive".into(),
-            ));
+            return Err(ConfigError::InvalidGpaInterval);
         }
         if self.max_curve_failures == 0 {
-            return Err(ConfigError::Invalid(
-                "max_curve_failures must be positive".into(),
-            ));
+            return Err(ConfigError::InvalidMaxCurveFailures);
         }
         Ok(())
     }
     fn validate_local(&self) -> Result<(), ConfigError> {
         if !matches!(self.log_format.as_str(), "text" | "json") {
-            return Err(ConfigError::Invalid(
-                "log_format must be text or json".into(),
-            ));
+            return Err(ConfigError::InvalidLogFormat);
         }
         Ok(())
     }
@@ -250,12 +263,12 @@ fn expand_home(path: &Path) -> Result<PathBuf, ConfigError> {
     if path == Path::new("~") {
         return env::var_os("HOME")
             .map(PathBuf::from)
-            .ok_or_else(|| ConfigError::Invalid("HOME is required for ~ expansion".into()));
+            .ok_or(ConfigError::HomeRequired);
     }
     if let Ok(rest) = path.strip_prefix("~") {
         return env::var_os("HOME")
             .map(|home| PathBuf::from(home).join(rest))
-            .ok_or_else(|| ConfigError::Invalid("HOME is required for ~ expansion".into()));
+            .ok_or(ConfigError::HomeRequired);
     }
     Ok(path.to_owned())
 }
