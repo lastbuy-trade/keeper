@@ -1,4 +1,6 @@
+use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
+use solana_rpc_client_types::config::{RpcAccountInfoConfig, RpcProgramAccountsConfig, UiAccountEncoding};
 use std::collections::{HashMap, HashSet};
 
 /// A validated account from a context-bearing confirmed GPA response.
@@ -238,15 +240,44 @@ impl ScanError {
     }
 }
 
-fn scan_params(status: u8, min_context_slot: Option<u64>) -> serde_json::Value {
-    let filters = vec![
-        RpcFilterType::Memcmp(Memcmp::new_base58_encoded(0, &CURVE_STATE_DISCRIMINATOR)),
-        RpcFilterType::Memcmp(Memcmp::new_base58_encoded(9, &[status])),
-    ];
-    let mut config = serde_json::json!({"encoding":"base64", "commitment":"confirmed", "withContext":true, "filters":filters});
-    if let Some(slot) = min_context_slot {
-        config["minContextSlot"] = slot.into();
+fn scan_config(
+    status: u8,
+    min_context_slot: Option<u64>,
+) -> RpcProgramAccountsConfig {
+    RpcProgramAccountsConfig {
+        filters: Some(vec![
+            RpcFilterType::Memcmp(
+                Memcmp::new_base58_encoded(
+                    0,
+                    &CURVE_STATE_DISCRIMINATOR,
+                ),
+            ),
+            RpcFilterType::Memcmp(
+                Memcmp::new_base58_encoded(
+                    9, 
+                    &[status]
+                ),
+            ),
+        ]),
+        account_config: RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::Base64),
+            commitment: Some(CommitmentConfig::confirmed()),
+            min_context_slot: min_context_slot,
+            ..RpcAccountInfoConfig::default()
+        },
+        with_context: Some(true),
+        ..RpcProgramAccountsConfig::default()
     }
+}
+
+fn scan_params(
+    status: u8,
+    min_context_slot: Option<u64>,
+) -> serde_json::Value {
+    let config = scan_config(
+        status, 
+        min_context_slot
+    );
     serde_json::json!([PROGRAM_ID.to_string(), config])
 }
 
