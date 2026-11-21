@@ -10,7 +10,7 @@ use crate::{
 use borsh::BorshDeserialize;
 use lastbuy_sdk::{
     accounts::GlobalConfig,
-    bonding_curve::constants::{GLOBAL_CONFIG_DISCRIMINATOR, PROGRAM_ID},
+    bonding_curve::constants::{ANCHOR_DISCRIMINATOR_SIZE, GLOBAL_CONFIG_DISCRIMINATOR, PROGRAM_ID},
     pda::derive_global_config,
 };
 use solana_keypair::{Keypair, Signer};
@@ -246,7 +246,7 @@ pub async fn prepare_attempt(
         .ok_or(PipelineError::InvalidAccountData("payer"))?;
     let (discriminator, mut data) = config_account
         .data
-        .split_at_checked(8)
+        .split_at_checked(ANCHOR_DISCRIMINATOR_SIZE)
         .ok_or(PipelineError::GlobalConfig)?;
     if config_account.owner != PROGRAM_ID || discriminator != GLOBAL_CONFIG_DISCRIMINATOR {
         return Err(PipelineError::GlobalConfig);
