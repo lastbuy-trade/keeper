@@ -469,6 +469,44 @@ pub fn read_summary(path: &Path) -> Result<Replay, LedgerError> {
     }
     Ok(replay)
 }
+
+/// Remove the active ledger while holding the writer lock. A missing state directory or ledger
+/// is an idempotent no-op; forensic tail backups and other files are left untouched.
+pub fn reset(state_dir: &Path) -> Result<bool, LedgerError> {
+    match fs::metadata(state_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(LedgerError::Invalid(
+                "state directory path is not a directory".into(),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    let _lock = acquire_lock(state_dir)?;
+    let ledger_path = state_dir.join("ledger.jsonl");
+    match fs::remove_file(&ledger_path) {
+        Ok(()) => {
+            File::open(state_dir)?.sync_all()?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn acquire_lock(state_dir: &Path) -> Result<File, LedgerError> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(state_dir.join("ledger.lock"))?;
+    lock.try_lock()
+        .map_err(|e| LedgerError::Invalid(format!("cannot acquire exclusive ledger lock: {e}")))?;
+    Ok(lock)
+}
+
 pub struct Ledger {
     file: File,
     _lock: File,
@@ -478,15 +516,7 @@ pub struct Ledger {
 impl Ledger {
     pub fn open(state_dir: &Path, genesis_hash: &str, payer: &str) -> Result<Self, LedgerError> {
         fs::create_dir_all(state_dir)?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(state_dir.join("ledger.lock"))?;
-        lock.try_lock().map_err(|e| {
-            LedgerError::Invalid(format!("cannot acquire exclusive ledger lock: {e}"))
-        })?;
+        let lock = acquire_lock(state_dir)?;
         let path = state_dir.join("ledger.jsonl");
         let mut file = OpenOptions::new()
             .read(true)

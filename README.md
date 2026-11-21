@@ -21,3 +21,5 @@ keypair_path = "~/.config/solana/id.json"
 `keeper init` creates `keeper.toml` for ordinary settings and a private, Git-ignored `keeper.secrets.toml` for RPC/gRPC URLs and the optional token. `KEEPER_RPC_URL`, `KEEPER_GRPC_URL`, and `KEEPER_GRPC_X_TOKEN` override those secret values. Keep the secrets file on a trusted machine and do not share it.
 
 Use `keeper profit --config keeper.toml` to view realized net profit and failed transaction costs. Accounting uses finalized transaction balances and persists in the configured state directory.
+
+Use `keeper reset-ledger --config keeper.toml` to permanently remove the active ledger. This discards its accounting, pending attempt history, and durable submission exclusions. The next `keeper run` initializes a fresh ledger.

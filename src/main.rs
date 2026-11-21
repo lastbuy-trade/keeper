@@ -18,14 +18,27 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    if matches!(cli.command, Command::Init) {
-        return init_config();
-    }
     let (action, options) = match cli.command {
+        Command::Init => return init_config(),
+        Command::ResetLedger(options) => {
+            let config = Config::load_local(&options.config, None)?;
+            let removed = ledger::reset(&config.state_dir)?;
+            if removed {
+                println!(
+                    "Removed active ledger at {}. The next run will initialize a fresh ledger.",
+                    config.state_dir.join("ledger.jsonl").display()
+                );
+            } else {
+                println!(
+                    "No active ledger found at {}; nothing was removed.",
+                    config.state_dir.join("ledger.jsonl").display()
+                );
+            }
+            return Ok(());
+        }
         Command::Run(options) => ("run", options),
         Command::Check(options) => ("check", options),
         Command::Profit(options) => ("profit", options),
-        Command::Init => unreachable!(),
     };
     let config = if action == "profit" {
         Config::load_profit(&options.config, options.log.as_deref())?

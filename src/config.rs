@@ -18,6 +18,8 @@ pub enum Command {
     Run(Options),
     Check(Options),
     Profit(Options),
+    #[command(about = "Permanently delete the active ledger and its accounting history")]
+    ResetLedger(LocalOptions),
     Init,
 }
 #[derive(Debug, clap::Args)]
@@ -26,6 +28,11 @@ pub struct Options {
     pub config: PathBuf,
     #[arg(long)]
     pub log: Option<String>,
+}
+#[derive(Debug, clap::Args)]
+pub struct LocalOptions {
+    #[arg(long, default_value = "keeper.toml")]
+    pub config: PathBuf,
 }
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -102,9 +109,12 @@ impl Config {
     pub fn load(path: &Path, log_override: Option<&str>) -> Result<Self, ConfigError> {
         Self::load_for(path, log_override, false)
     }
-    /// Load only the local settings needed to read the ledger.
-    pub fn load_profit(path: &Path, log_override: Option<&str>) -> Result<Self, ConfigError> {
+    /// Load local settings without reading secrets or requiring service configuration.
+    pub fn load_local(path: &Path, log_override: Option<&str>) -> Result<Self, ConfigError> {
         Self::load_for(path, log_override, true)
+    }
+    pub fn load_profit(path: &Path, log_override: Option<&str>) -> Result<Self, ConfigError> {
+        Self::load_local(path, log_override)
     }
     fn load_for(
         path: &Path,
