@@ -114,6 +114,7 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
     let (commands, mut command_rx) = mpsc::channel::<ExecutionCommand>(1);
     let (results, mut result_rx) = mpsc::channel(1);
     let (terminal_tx, mut terminal_rx) = mpsc::unbounded_channel::<Pubkey>();
+    let (lane_ready_tx, mut lane_ready_rx) = tokio::sync::watch::channel(false);
     let execution_rpc = rpc.clone();
     let mut execution = tokio::spawn(async move {
         let mut coordinator = Coordinator::new(
@@ -123,6 +124,7 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
             Some(policy),
             RPC_TIMEOUT,
         )?;
+        lane_ready_tx.send_replace(coordinator.execution_lane_available());
         let (settlement_tx, mut settlement_rx) = mpsc::channel(1);
         let mut settlement_task: Option<tokio::task::JoinHandle<()>> = None;
         let mut recovery = tokio::time::interval(Duration::from_secs(10));
@@ -160,6 +162,7 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
                         Ok(None) => {}
                         Err(error) => log::warn!("pending attempt recovery failed: {}", error_class(&error)),
                     }
+                    lane_ready_tx.send_replace(coordinator.execution_lane_available());
                 }
                 Some(response) = settlement_rx.recv() => {
                     if let Some(task) = settlement_task.take() { let _ = task.await; }
@@ -170,12 +173,14 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
                     if let Some(curve) = coordinator.successful_curve_for_signature(&signature) {
                         let _ = terminal_tx.send(curve);
                     }
+                    lane_ready_tx.send_replace(coordinator.execution_lane_available());
                 }
                 item = command_rx.recv() => {
                     let Some(item) = item else { break };
                     match item {
                         ExecutionCommand::Candidate(item) => {
                             let outcome = coordinator.step(item, &mut cancel_rx).await;
+                            lane_ready_tx.send_replace(coordinator.execution_lane_available());
                             tokio::select! {
                                 _ = cancel_rx.changed() => break,
                                 sent = results.send((item, outcome)) => if sent.is_err() { break; },
@@ -265,7 +270,7 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
                         if let Some(curve) = successful_curve {
                             scheduler.finalize_success(curve);
                         }
-                        scheduler.defer(item.curve, Instant::now());
+                        scheduler.release_for_retry(item.curve);
                     }
                     Err(error) if should_defer(&error) => {
                         log::warn!("curve={} execution deferred: {}", item.curve, error_class(&error));
@@ -279,6 +284,10 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
             }
             Some(curve) = terminal_rx.recv() => {
                 scheduler.finalize_success(curve);
+            }
+            changed = lane_ready_rx.changed() => {
+                if changed.is_err() { break Err(RuntimeError::ExecutionStopped); }
+                let _ = lane_ready_rx.borrow_and_update();
             }
             changed = connection_rx.changed() => {
                 if changed.is_err() { break Err(RuntimeError::MonitorConnectionClosed); }
@@ -335,7 +344,7 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
             needed.store(true, Ordering::Release);
         }
         // Dispatch queued candidates even while reconciliation is running or backing off.
-        if let Some(item) = scheduler.next(Instant::now())
+        if let Some(item) = next_dispatch(&mut scheduler, &lane_ready_rx, Instant::now())
             && commands
                 .try_send(ExecutionCommand::Candidate(item))
                 .is_err()
@@ -376,6 +385,16 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
         let _ = execution.await;
     }
     outcome
+}
+
+fn next_dispatch(
+    scheduler: &mut Scheduler,
+    lane_ready: &tokio::sync::watch::Receiver<bool>,
+    now: Instant,
+) -> Option<Candidate> {
+    (*lane_ready.borrow())
+        .then(|| scheduler.next(now))
+        .flatten()
 }
 
 async fn retry_candidate(
@@ -449,14 +468,19 @@ fn should_defer(error: &crate::coordinator::CoordinatorError) -> bool {
                 error == solana_rpc_client::api::response::TransactionError::BlockhashNotFound
             })
         }
-        Preparation(
+        Preparation(PipelineError::Persistence(SubmissionError::CurvePendingOrComplete))
+        | Preparation(
             PipelineError::Timeout
             | PipelineError::StaleContext
             | PipelineError::NearExpiry
             | PipelineError::MissingAccount(_)
             | PipelineError::InvalidAccountData(_),
         )
-        | Recovery(SubmissionError::Timeout | SubmissionError::PendingAttempt)
+        | Recovery(
+            SubmissionError::Timeout
+            | SubmissionError::PendingAttempt
+            | SubmissionError::CurvePendingOrComplete,
+        )
         | Preparation(PipelineError::Simulation(
             SimulationError::Timeout | SimulationError::StaleContext,
         ))
@@ -691,10 +715,72 @@ mod tests {
     }
 
     #[test]
+    fn same_curve_finalized_settlement_wait_does_not_count_as_failure() {
+        let error = crate::coordinator::CoordinatorError::Preparation(
+            crate::pipeline::PipelineError::Persistence(
+                crate::submission::SubmissionError::CurvePendingOrComplete,
+            ),
+        );
+        assert!(should_defer(&error));
+    }
+
+    #[test]
     fn reconciliation_can_resume_with_queued_candidates() {
         assert!(scan_has_capacity(1));
         assert!(scan_has_capacity(CAPACITY - 1));
         assert!(!scan_has_capacity(CAPACITY));
+    }
+
+    #[test]
+    fn queued_candidate_dispatches_immediately_when_recovery_releases_lane() {
+        let mut scheduler =
+            Scheduler::new(CAPACITY, Duration::from_secs(2), Duration::from_secs(60));
+        let now = Instant::now();
+        let candidate = || Candidate {
+            curve: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+            slot: 1,
+            write_version: None,
+        };
+        let first = candidate();
+        let waiting = candidate();
+        assert_eq!(scheduler.enqueue(first, now), EnqueueResult::Added);
+        assert_eq!(scheduler.enqueue(waiting, now), EnqueueResult::Added);
+        assert_eq!(scheduler.next(now), Some(first));
+
+        // A pending attempt releases its scheduler reservation but keeps the serial lane closed.
+        scheduler.defer(first.curve, now);
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        assert_eq!(next_dispatch(&mut scheduler, &ready_rx, now), None);
+
+        // Finalized recovery signals readiness, and the waiter runs without a cooldown.
+        ready_tx.send_replace(true);
+        assert_eq!(next_dispatch(&mut scheduler, &ready_rx, now), Some(waiting));
+    }
+
+    #[test]
+    fn recovery_preemption_preserves_candidate_readiness_and_position() {
+        let mut scheduler =
+            Scheduler::new(CAPACITY, Duration::from_secs(2), Duration::from_secs(60));
+        let now = Instant::now();
+        let first = Candidate {
+            curve: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+            slot: 1,
+            write_version: None,
+        };
+        let second = Candidate {
+            curve: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+            slot: 1,
+            write_version: None,
+        };
+        scheduler.enqueue(first, now);
+        scheduler.enqueue(second, now);
+        assert_eq!(scheduler.next(now), Some(first));
+        assert!(scheduler.release_for_retry(first.curve));
+        assert_eq!(scheduler.next(now), Some(first));
+        assert_eq!(scheduler.next(now), None);
     }
 
     #[test]

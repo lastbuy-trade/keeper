@@ -88,6 +88,15 @@ impl<'a> Coordinator<'a> {
         self.ledger.replay.successful_curves()
     }
 
+    /// Whether discovery work can enter without preemptive recovery of ambiguous inclusion.
+    pub fn execution_lane_available(&self) -> bool {
+        self.ledger
+            .replay
+            .inclusion_ambiguous_attempts()
+            .next()
+            .is_none()
+    }
+
     pub fn successful_curve_for_signature(&self, signature: &str) -> Option<Pubkey> {
         self.ledger
             .replay

@@ -325,6 +325,19 @@ impl Scheduler {
         }
     }
 
+    /// Release a candidate preempted by recovery while keeping its original queue position
+    /// and eligibility time. The runtime gates dispatch until the executor signals readiness.
+    pub fn release_for_retry(&mut self, curve: Pubkey) -> bool {
+        if self.active != Some(curve) {
+            return false;
+        }
+        self.active = None;
+        if self.finalized_success.contains(&curve) {
+            self.entries.remove(&curve);
+        }
+        true
+    }
+
     /// Retain a failed candidate with exponential cooldown capped at `retry_max`.
     /// Evict on overflow or when the configured failure limit is reached.
     pub fn retry(&mut self, curve: Pubkey, now: Instant) -> bool {
