@@ -1,5 +1,6 @@
 target/
 .env
+keeper.secrets.toml
 docs/superpowers/plans
 .omx-state-locks.identity.json
 .omx-state-locks/
