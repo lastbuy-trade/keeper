@@ -530,83 +530,86 @@ fn rpc_diagnostic(error: &RpcError) -> String {
 }
 
 fn error_class(error: &crate::coordinator::CoordinatorError) -> String {
-    use crate::{coordinator::CoordinatorError, pipeline::PipelineError};
+    use crate::coordinator::CoordinatorError;
+
     match error {
         CoordinatorError::MissingPolicy => "missing execution policy".into(),
         CoordinatorError::Cancelled => "cancelled".into(),
-        CoordinatorError::Preparation(PipelineError::Rpc(error))
-        | CoordinatorError::Preparation(PipelineError::Simulation(
-            crate::executor::SimulationError::Rpc(error),
-        )) => rpc_diagnostic(error),
-        CoordinatorError::Preparation(PipelineError::Persistence(error))
-        | CoordinatorError::Recovery(error) => submission_error_class(error),
-        CoordinatorError::Preparation(PipelineError::Simulation(
-            crate::executor::SimulationError::Rejected { error, .. },
-        )) => simulation_rejection_class("simulation", error),
-        CoordinatorError::Preparation(error) => match error {
-            PipelineError::Timeout => "preparation RPC timeout",
-            PipelineError::WrongCluster => "ledger and RPC cluster mismatch",
-            PipelineError::WrongPayer => "ledger and payer mismatch",
-            PipelineError::MissingAccount(account) => {
-                return format!("required {account} account missing");
-            }
-            PipelineError::InvalidAccountData(account) => {
-                return format!("invalid RPC account data: {account}");
-            }
-            PipelineError::StaleContext => "RPC context is stale",
-            PipelineError::AlreadyMigrated(_) => "curve already migrated",
-            PipelineError::FeeBounds => "quoted fee exceeds policy",
-            PipelineError::NearExpiry => "blockhash near expiry",
-            PipelineError::ResourceBounds => "simulation exceeds resource policy",
-            PipelineError::Simulation(crate::executor::SimulationError::BelowMinimum {
-                ..
-            }) => "simulated profit below minimum",
-            PipelineError::Simulation(crate::executor::SimulationError::MissingBalances) => {
-                "simulation balance data unavailable"
-            }
-            PipelineError::Simulation(_) => "simulation failed",
-            PipelineError::Curve(_) => "invalid curve",
-            PipelineError::GlobalConfig => "invalid global configuration",
-            PipelineError::MissingPolicy | PipelineError::InvalidPolicy => {
-                "invalid execution policy"
-            }
-            PipelineError::Build(_) | PipelineError::Serialize => "transaction construction failed",
-            PipelineError::Rpc(_) | PipelineError::Persistence(_) => unreachable!(),
+        CoordinatorError::Preparation(error) => preparation_error_class(error),
+        CoordinatorError::Recovery(error) => submission_error_class(error),
+    }
+}
+
+fn preparation_error_class(error: &crate::pipeline::PipelineError) -> String {
+    use crate::{executor::SimulationError, pipeline::PipelineError};
+
+    match error {
+        PipelineError::Timeout => "preparation RPC timeout".into(),
+        PipelineError::WrongCluster => "ledger and RPC cluster mismatch".into(),
+        PipelineError::WrongPayer => "ledger and payer mismatch".into(),
+        PipelineError::MissingAccount(account) => format!("required {account} account missing"),
+        PipelineError::InvalidAccountData(account) => {
+            format!("invalid RPC account data: {account}")
         }
-        .into(),
+        PipelineError::StaleContext => "RPC context is stale".into(),
+        PipelineError::AlreadyMigrated(_) => "curve already migrated".into(),
+        PipelineError::FeeBounds => "quoted fee exceeds policy".into(),
+        PipelineError::NearExpiry => "blockhash near expiry".into(),
+        PipelineError::ResourceBounds => "simulation exceeds resource policy".into(),
+        PipelineError::Simulation(SimulationError::BelowMinimum { .. }) => {
+            "simulated profit below minimum".into()
+        }
+        PipelineError::Simulation(SimulationError::MissingBalances) => {
+            "simulation balance data unavailable".into()
+        }
+        PipelineError::Rpc(error) | PipelineError::Simulation(SimulationError::Rpc(error)) => {
+            rpc_diagnostic(error)
+        }
+        PipelineError::Simulation(SimulationError::Rejected { error, .. }) => {
+            simulation_rejection_class("simulation", error)
+        }
+        PipelineError::Simulation(_) => "simulation failed".into(),
+        PipelineError::Curve(_) => "invalid curve".into(),
+        PipelineError::GlobalConfig => "invalid global configuration".into(),
+        PipelineError::MissingPolicy | PipelineError::InvalidPolicy => {
+            "invalid execution policy".into()
+        }
+        PipelineError::Build(_) | PipelineError::Serialize => {
+            "transaction construction failed".into()
+        }
+        PipelineError::Persistence(error) => submission_error_class(error),
     }
 }
 
 fn submission_error_class(error: &crate::submission::SubmissionError) -> String {
-    use crate::submission::SubmissionError;
-    if let SubmissionError::Simulation(crate::executor::SimulationError::Rejected {
-        error, ..
-    }) = error
-    {
-        return simulation_rejection_class("send-time simulation", error);
-    }
+    use crate::{
+        accounting::AccountingError, executor::SimulationError, submission::SubmissionError,
+    };
+
     match error {
         SubmissionError::Ledger(_) => "ledger operation failed",
-        SubmissionError::Rpc(error)
-        | SubmissionError::Simulation(crate::executor::SimulationError::Rpc(error)) => {
+        SubmissionError::Rpc(error) | SubmissionError::Simulation(SimulationError::Rpc(error)) => {
             return rpc_diagnostic(error);
+        }
+        SubmissionError::Simulation(SimulationError::Rejected { error, .. }) => {
+            return simulation_rejection_class("send-time simulation", error);
         }
         SubmissionError::Timeout => "recovery RPC timeout",
         SubmissionError::InvalidAttempt => "invalid journaled attempt",
         SubmissionError::WrongCluster => "ledger and RPC cluster mismatch",
         SubmissionError::PendingAttempt => "another attempt remains unresolved",
         SubmissionError::CurvePendingOrComplete => "curve pending settlement or already complete",
-        SubmissionError::Accounting(crate::accounting::AccountingError::RpcUnavailable) => {
+        SubmissionError::Accounting(AccountingError::RpcUnavailable) => {
             "finalized transaction RPC unavailable"
         }
-        SubmissionError::Accounting(crate::accounting::AccountingError::InvalidEvidence) => {
+        SubmissionError::Accounting(AccountingError::InvalidEvidence) => {
             "finalized transaction evidence invalid"
         }
         SubmissionError::Accounting(_) => "finalized accounting failed",
-        SubmissionError::Simulation(crate::executor::SimulationError::BelowMinimum { .. }) => {
+        SubmissionError::Simulation(SimulationError::BelowMinimum { .. }) => {
             "send-time profit below minimum"
         }
-        SubmissionError::Simulation(crate::executor::SimulationError::MissingBalances) => {
+        SubmissionError::Simulation(SimulationError::MissingBalances) => {
             "simulation balance data unavailable"
         }
         SubmissionError::Simulation(_) => "send-time simulation failed",
