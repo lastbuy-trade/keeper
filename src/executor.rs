@@ -1,5 +1,22 @@
 //! Transaction simulation and balance-delta estimation.
 
+use std::time::Duration;
+
+use solana_message::VersionedMessage;
+use solana_rpc_client::{
+    api::{
+        client_error::Error as RpcError,
+        config::{CommitmentConfig, RpcSimulateTransactionConfig},
+        response::UiTransactionError,
+    },
+    nonblocking::rpc_client::RpcClient,
+};
+use solana_transaction::versioned::VersionedTransaction;
+
+const PAYER_ACCOUNT_INDEX: usize = 0;
+const MAX_DIAGNOSTIC_LOG_LINES: usize = 32;
+const MAX_DIAGNOSTIC_LOG_CHARS: usize = 512;
+
 /// Compute the payer delta from a single simulation response; missing fields fail closed.
 pub fn simulated_payer_delta(
     pre: Option<&[u64]>,
@@ -14,57 +31,15 @@ pub fn simulated_payer_delta(
     Some(i128::from(*post.get(payer_index)?) - i128::from(*pre.get(payer_index)?))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn missing_or_mismatched_simulation_balances_are_unknown() {
-        assert_eq!(
-            simulated_payer_delta(Some(&[100]), Some(&[90]), 0, 1),
-            Some(-10)
-        );
-        assert_eq!(simulated_payer_delta(Some(&[100]), None, 0, 1), None);
-        assert_eq!(
-            simulated_payer_delta(Some(&[100]), Some(&[90, 1]), 0, 1),
-            None
-        );
-        assert_eq!(simulated_payer_delta(Some(&[100]), Some(&[90]), 0, 2), None);
-        assert_eq!(
-            simulated_payer_delta(Some(&[100, 4]), Some(&[90, 4]), 0, 2),
-            Some(-10)
-        );
-    }
-    #[test]
-    fn rejection_preserves_error_and_bounded_logs_without_displaying_logs() {
-        use solana_rpc_client::api::response::TransactionError;
-        let error = simulation_rejection(
-            TransactionError::AccountNotFound.into(),
-            Some(vec!["diagnostic".into(), "x".repeat(600)]),
-        );
-        assert!(!error.to_string().contains("diagnostic"));
-        match error {
-            SimulationError::Rejected { error, logs } => {
-                assert_eq!(
-                    TransactionError::from(error),
-                    TransactionError::AccountNotFound
-                );
-                assert_eq!(logs[0], "diagnostic");
-                assert_eq!(logs[1].len(), 512);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum SimulationError {
     #[error("simulation RPC failed")]
-    Rpc(#[from] solana_rpc_client::api::client_error::Error),
+    Rpc(#[from] RpcError),
     #[error("simulation request timed out")]
     Timeout,
     #[error("simulation rejected the transaction: {error}")]
     Rejected {
-        error: solana_rpc_client::api::response::UiTransactionError,
+        error: UiTransactionError,
         // Untrusted program output; kept for explicit diagnostics, not included in Display.
         logs: Vec<String>,
     },
@@ -89,17 +64,17 @@ pub struct SimulationEstimate {
 
 /// Simulate the exact signed transaction. A missing payer delta or resource measurement fails closed.
 pub async fn simulate_final_transaction(
-    rpc: &solana_rpc_client::nonblocking::rpc_client::RpcClient,
-    transaction: &solana_transaction::versioned::VersionedTransaction,
+    rpc: &RpcClient,
+    transaction: &VersionedTransaction,
     min_profit_lamports: i128,
     min_context_slot: u64,
-    timeout: std::time::Duration,
+    timeout: Duration,
 ) -> Result<SimulationEstimate, SimulationError> {
-    use solana_rpc_client::api::config::{CommitmentConfig, RpcSimulateTransactionConfig};
-    let solana_message::VersionedMessage::V1(message) = &transaction.message else {
+    let VersionedMessage::V1(message) = &transaction.message else {
         return Err(SimulationError::UnsupportedVersion);
     };
     let account_key_count = message.account_keys.len();
+
     let config = RpcSimulateTransactionConfig {
         sig_verify: true,
         min_context_slot: Some(min_context_slot),
@@ -112,24 +87,27 @@ pub async fn simulate_final_transaction(
     )
     .await
     .map_err(|_| SimulationError::Timeout)??;
+
     if result.context.slot < min_context_slot {
         return Err(SimulationError::StaleContext);
     }
-    let result = result.value;
-    if let Some(error) = result.err {
-        return Err(simulation_rejection(error, result.logs));
+    let simulation = result.value;
+    if let Some(error) = simulation.err {
+        return Err(simulation_rejection(error, simulation.logs));
     }
+
+    // The transaction's fee payer is account key zero in the supported message.
     let payer_delta_lamports = simulated_payer_delta(
-        result.pre_balances.as_deref(),
-        result.post_balances.as_deref(),
-        0,
+        simulation.pre_balances.as_deref(),
+        simulation.post_balances.as_deref(),
+        PAYER_ACCOUNT_INDEX,
         account_key_count,
     )
     .ok_or(SimulationError::MissingBalances)?;
-    let units_consumed = result
+    let units_consumed = simulation
         .units_consumed
         .ok_or(SimulationError::MissingResources)?;
-    let loaded_accounts_data_size = result
+    let loaded_accounts_data_size = simulation
         .loaded_accounts_data_size
         .ok_or(SimulationError::MissingResources)?;
     if payer_delta_lamports < min_profit_lamports {
@@ -138,6 +116,7 @@ pub async fn simulate_final_transaction(
             minimum: min_profit_lamports,
         });
     }
+
     Ok(SimulationEstimate {
         payer_delta_lamports,
         units_consumed,
@@ -146,15 +125,57 @@ pub async fn simulate_final_transaction(
 }
 
 // Bound untrusted program output before retaining it; never include it in error Display.
-fn simulation_rejection(
-    error: solana_rpc_client::api::response::UiTransactionError,
-    logs: Option<Vec<String>>,
-) -> SimulationError {
+fn simulation_rejection(error: UiTransactionError, logs: Option<Vec<String>>) -> SimulationError {
     let logs = logs
         .unwrap_or_default()
         .into_iter()
-        .take(32)
-        .map(|line| line.chars().take(512).collect())
+        .take(MAX_DIAGNOSTIC_LOG_LINES)
+        .map(|line| line.chars().take(MAX_DIAGNOSTIC_LOG_CHARS).collect())
         .collect();
     SimulationError::Rejected { error, logs }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_or_mismatched_simulation_balances_are_unknown() {
+        assert_eq!(
+            simulated_payer_delta(Some(&[100]), Some(&[90]), 0, 1),
+            Some(-10)
+        );
+        assert_eq!(simulated_payer_delta(Some(&[100]), None, 0, 1), None);
+        assert_eq!(
+            simulated_payer_delta(Some(&[100]), Some(&[90, 1]), 0, 1),
+            None
+        );
+        assert_eq!(simulated_payer_delta(Some(&[100]), Some(&[90]), 0, 2), None);
+        assert_eq!(
+            simulated_payer_delta(Some(&[100, 4]), Some(&[90, 4]), 0, 2),
+            Some(-10)
+        );
+    }
+
+    #[test]
+    fn rejection_preserves_error_and_bounded_logs_without_displaying_logs() {
+        use solana_rpc_client::api::response::TransactionError;
+
+        let error = simulation_rejection(
+            TransactionError::AccountNotFound.into(),
+            Some(vec!["diagnostic".into(), "x".repeat(600)]),
+        );
+        assert!(!error.to_string().contains("diagnostic"));
+        match error {
+            SimulationError::Rejected { error, logs } => {
+                assert_eq!(
+                    TransactionError::from(error),
+                    TransactionError::AccountNotFound
+                );
+                assert_eq!(logs[0], "diagnostic");
+                assert_eq!(logs[1].len(), 512);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 }
