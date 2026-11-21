@@ -1,0 +1,10 @@
+keypair_path = "~/.config/solana/id.json"
+# Secrets and provider endpoints belong in keeper.secrets.toml.
+# Full getProgramAccounts reconciliation interval; account changes arrive via Yellowstone.
+gpa_interval_seconds = 300
+# Stop retrying a curve after this many failed executions.
+max_curve_failures = 3
+# priority_fee_lamports = 1000
+# max_priority_fee_lamports = 10000
+# min_estimated_profit_lamports = 0
+# state_dir = "~/.local/state/lastbuy-keeper"
