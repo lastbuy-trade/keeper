@@ -15,11 +15,15 @@ pub struct Cli {
 }
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    #[command(about = "Run the migration keeper")]
     Run(Options),
+    #[command(about = "Check RPC, program, and gRPC connectivity")]
     Check(Options),
+    #[command(about = "Show realized profit and unresolved attempts")]
     Profit(Options),
     #[command(about = "Permanently delete the active ledger and its accounting history")]
     ResetLedger(LocalOptions),
+    #[command(about = "Create default configuration files")]
     Init,
 }
 #[derive(Debug, clap::Args)]
