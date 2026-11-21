@@ -453,13 +453,17 @@ mod tests {
     #[test]
     fn invalid_fee_and_redaction() {
         let mut c = Config {
-            rpc_url: "https://user:secret@example.com".into(),
-            grpc_url: "https://example.com".into(),
+            rpc_url: "https://rpc-user-unique:rpc-password-unique@example.com".into(),
+            grpc_url: "https://grpc.example.com?api_key=grpc-key-unique".into(),
             ..Default::default()
         };
-        c.grpc_x_token = Some("token-secret".into());
+        c.grpc_x_token = Some("grpc-token-unique".into());
         let debug = format!("{c:?}");
-        assert!(!debug.contains("secret"));
+        assert!(debug.contains("[secret]"));
+        assert!(!debug.contains("rpc-user-unique"));
+        assert!(!debug.contains("rpc-password-unique"));
+        assert!(!debug.contains("grpc-key-unique"));
+        assert!(!debug.contains("grpc-token-unique"));
         assert!(c.validate().is_ok());
         c.priority_fee_lamports = 10001;
         assert!(c.validate().is_err());
