@@ -7,6 +7,8 @@ use std::{
 use thiserror::Error;
 use url::Url;
 
+const MAX_DURATION_SECONDS: u64 = 31_536_000;
+
 #[derive(Debug, Parser)]
 #[command(version, about = "LastBuy migration keeper")]
 pub struct Cli {
@@ -59,7 +61,7 @@ pub enum ConfigError {
     InvalidServiceUrl(&'static str),
     #[error("invalid configuration: priority fee exceeds configured cap")]
     PriorityFeeExceedsCap,
-    #[error("invalid configuration: gpa_interval_seconds must be positive")]
+    #[error("invalid configuration: gpa_interval_seconds must be between 1 and 31536000")]
     InvalidGpaInterval,
     #[error("invalid configuration: max_curve_failures must be positive")]
     InvalidMaxCurveFailures,
@@ -67,6 +69,25 @@ pub enum ConfigError {
     InvalidLogFormat,
     #[error("invalid configuration: HOME is required for ~ expansion")]
     HomeRequired,
+    #[error("cannot read advanced configuration file {path}: {source}")]
+    AdvancedRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("invalid advanced configuration file {path} at line {line}; check its values and keys")]
+    AdvancedToml { path: PathBuf, line: usize },
+    #[error(
+        "invalid advanced configuration at {path}: {field} must be positive and no more than one year"
+    )]
+    InvalidAdvancedDuration { path: PathBuf, field: &'static str },
+    #[error(
+        "invalid advanced configuration at {path}: gpa_request_spacing_ms must be between 0 and {max} milliseconds"
+    )]
+    InvalidAdvancedSpacing { path: PathBuf, max: u64 },
+    #[error(
+        "invalid advanced configuration at {path}: scheduler_retry_initial_seconds must not exceed scheduler_retry_max_seconds"
+    )]
+    InvalidRetryRange { path: PathBuf },
 }
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -83,9 +104,50 @@ pub struct Config {
     pub gpa_interval_seconds: u64,
     pub max_curve_failures: u8,
     #[serde(skip)]
+    pub advanced: AdvancedConfig,
+    #[serde(skip)]
     pub grpc_x_token: Option<String>,
     #[serde(skip)]
     pub secrets_file: PathBuf,
+}
+#[derive(Clone, Debug)]
+pub struct AdvancedConfig {
+    pub rpc_timeout_seconds: u64,
+    pub settlement_timeout_seconds: u64,
+    pub pending_recovery_poll_seconds: u64,
+    pub gpa_request_spacing_ms: u64,
+    pub grpc_slot_idle_timeout_seconds: u64,
+    pub scheduler_retry_initial_seconds: u64,
+    pub scheduler_retry_max_seconds: u64,
+}
+impl Default for AdvancedConfig {
+    fn default() -> Self {
+        Self {
+            rpc_timeout_seconds: 900,
+            settlement_timeout_seconds: 150,
+            pending_recovery_poll_seconds: 10,
+            gpa_request_spacing_ms: 100,
+            grpc_slot_idle_timeout_seconds: 30,
+            scheduler_retry_initial_seconds: 2,
+            scheduler_retry_max_seconds: 60,
+        }
+    }
+}
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AdvancedOverrides {
+    rpc_timeout_seconds: Option<u64>,
+    settlement_timeout_seconds: Option<u64>,
+    pending_recovery_poll_seconds: Option<u64>,
+    gpa_request_spacing_ms: Option<u64>,
+    grpc_slot_idle_timeout_seconds: Option<u64>,
+    scheduler_retry_initial_seconds: Option<u64>,
+    scheduler_retry_max_seconds: Option<u64>,
+    priority_fee_lamports: Option<u64>,
+    max_priority_fee_lamports: Option<u64>,
+    min_estimated_profit_lamports: Option<i64>,
+    gpa_interval_seconds: Option<u64>,
+    max_curve_failures: Option<u8>,
 }
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -104,6 +166,7 @@ impl std::fmt::Debug for Config {
             )
             .field("gpa_interval_seconds", &self.gpa_interval_seconds)
             .field("max_curve_failures", &self.max_curve_failures)
+            .field("advanced", &self.advanced)
             .field(
                 "grpc_x_token",
                 &self.grpc_x_token.as_ref().map(|_| "[secret]"),
@@ -125,6 +188,7 @@ impl Default for Config {
             min_estimated_profit_lamports: 0,
             gpa_interval_seconds: 300,
             max_curve_failures: 3,
+            advanced: AdvancedConfig::default(),
             grpc_x_token: None,
             secrets_file: "keeper.secrets.toml".into(),
         }
@@ -148,6 +212,10 @@ impl Config {
     ) -> Result<Self, ConfigError> {
         let mut config: Self = toml::from_str(&fs::read_to_string(path)?)?;
         config.secrets_file = path.with_file_name("keeper.secrets.toml");
+        let advanced_path = path.with_file_name("keeper.advanced.toml");
+        if !profit {
+            load_advanced(&advanced_path, &mut config)?;
+        }
         if !profit && config.secrets_file.exists() {
             #[derive(Deserialize, Default)]
             #[serde(default, deny_unknown_fields)]
@@ -244,12 +312,16 @@ impl Config {
         if self.priority_fee_lamports > self.max_priority_fee_lamports {
             return Err(ConfigError::PriorityFeeExceedsCap);
         }
-        if self.gpa_interval_seconds == 0 {
+        if !(1..=MAX_DURATION_SECONDS).contains(&self.gpa_interval_seconds) {
             return Err(ConfigError::InvalidGpaInterval);
         }
         if self.max_curve_failures == 0 {
             return Err(ConfigError::InvalidMaxCurveFailures);
         }
+        validate_advanced(
+            &self,
+            &self.secrets_file.with_file_name("keeper.advanced.toml"),
+        )?;
         Ok(())
     }
     fn validate_local(&self) -> Result<(), ConfigError> {
@@ -258,6 +330,109 @@ impl Config {
         }
         Ok(())
     }
+}
+fn load_advanced(path: &Path, config: &mut Config) -> Result<(), ConfigError> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(ConfigError::AdvancedRead {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    let overrides: AdvancedOverrides =
+        toml::from_str(&contents).map_err(|error| ConfigError::AdvancedToml {
+            path: path.to_owned(),
+            line: error
+                .span()
+                .map(|span| {
+                    contents
+                        .as_bytes()
+                        .get(..span.start.min(contents.len()))
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|b| **b == b'\n')
+                        .count()
+                        + 1
+                })
+                .unwrap_or(1),
+        })?;
+    macro_rules! apply_overrides {
+        ($destination:ident, $($field:ident),+ $(,)?) => {
+            $(
+                $destination.$field = overrides.$field.unwrap_or($destination.$field);
+            )+
+        };
+    }
+    let advanced = &mut config.advanced;
+    apply_overrides!(
+        advanced,
+        rpc_timeout_seconds,
+        settlement_timeout_seconds,
+        pending_recovery_poll_seconds,
+        gpa_request_spacing_ms,
+        grpc_slot_idle_timeout_seconds,
+        scheduler_retry_initial_seconds,
+        scheduler_retry_max_seconds,
+    );
+    apply_overrides!(
+        config,
+        priority_fee_lamports,
+        max_priority_fee_lamports,
+        min_estimated_profit_lamports,
+        gpa_interval_seconds,
+        max_curve_failures,
+    );
+    Ok(())
+}
+
+fn validate_advanced(config: &Config, path: &Path) -> Result<(), ConfigError> {
+    let values = [
+        ("rpc_timeout_seconds", config.advanced.rpc_timeout_seconds),
+        (
+            "settlement_timeout_seconds",
+            config.advanced.settlement_timeout_seconds,
+        ),
+        (
+            "pending_recovery_poll_seconds",
+            config.advanced.pending_recovery_poll_seconds,
+        ),
+        (
+            "grpc_slot_idle_timeout_seconds",
+            config.advanced.grpc_slot_idle_timeout_seconds,
+        ),
+        (
+            "scheduler_retry_initial_seconds",
+            config.advanced.scheduler_retry_initial_seconds,
+        ),
+        (
+            "scheduler_retry_max_seconds",
+            config.advanced.scheduler_retry_max_seconds,
+        ),
+    ];
+    for (field, value) in values {
+        if value == 0 || value > MAX_DURATION_SECONDS {
+            return Err(ConfigError::InvalidAdvancedDuration {
+                path: path.to_owned(),
+                field,
+            });
+        }
+    }
+    if config.advanced.gpa_request_spacing_ms > MAX_DURATION_SECONDS * 1000 {
+        return Err(ConfigError::InvalidAdvancedSpacing {
+            path: path.to_owned(),
+            max: MAX_DURATION_SECONDS * 1000,
+        });
+    }
+    if config.advanced.scheduler_retry_initial_seconds > config.advanced.scheduler_retry_max_seconds
+    {
+        return Err(ConfigError::InvalidRetryRange {
+            path: path.to_owned(),
+        });
+    }
+    Ok(())
 }
 fn expand_home(path: &Path) -> Result<PathBuf, ConfigError> {
     if path == Path::new("~") {

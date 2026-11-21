@@ -36,12 +36,6 @@ enum ExecutionCommand {
 }
 
 const CAPACITY: usize = 1024;
-// Six HTTP attempts at 30 seconds each plus five provider cooldowns below 120 seconds.
-// Keep the outer deadline above the client's complete retry window.
-const RPC_TIMEOUT: Duration = Duration::from_secs(900);
-// Permit a provider cooldown below 120 seconds without blocking later settlements for 15 minutes.
-const SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(150);
-
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
     #[error("could not read the configured Solana keypair")]
@@ -69,6 +63,13 @@ pub enum RuntimeError {
 /// Starts confirmed discovery and a serial execution/recovery lane.
 pub async fn run(config: Config) -> Result<(), RuntimeError> {
     let mut terminate = termination_signal()?;
+    let rpc_timeout = Duration::from_secs(config.advanced.rpc_timeout_seconds);
+    let settlement_timeout = Duration::from_secs(config.advanced.settlement_timeout_seconds);
+    let request_spacing = Duration::from_millis(config.advanced.gpa_request_spacing_ms);
+    let recovery_poll = Duration::from_secs(config.advanced.pending_recovery_poll_seconds);
+    let grpc_idle_timeout = Duration::from_secs(config.advanced.grpc_slot_idle_timeout_seconds);
+    let retry_initial = Duration::from_secs(config.advanced.scheduler_retry_initial_seconds);
+    let retry_max = Duration::from_secs(config.advanced.scheduler_retry_max_seconds);
     let rpc = Arc::new(RpcClient::new_with_commitment(
         config.rpc_url.clone(),
         CommitmentConfig::confirmed(),
@@ -76,7 +77,7 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
     use solana_signer::Signer;
     let payer = solana_keypair::read_keypair_file(&config.keypair_path)
         .map_err(|_| RuntimeError::Keypair)?;
-    let genesis = tokio::time::timeout(RPC_TIMEOUT, rpc.get_genesis_hash())
+    let genesis = tokio::time::timeout(rpc_timeout, rpc.get_genesis_hash())
         .await
         .map_err(|_| RuntimeError::GenesisTimeout)?
         .map_err(|_| RuntimeError::GenesisRpc)?;
@@ -122,12 +123,12 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
             &mut ledger,
             &payer,
             Some(policy),
-            RPC_TIMEOUT,
+            rpc_timeout,
         )?;
         lane_ready_tx.send_replace(coordinator.execution_lane_available());
         let (settlement_tx, mut settlement_rx) = mpsc::channel(1);
         let mut settlement_task: Option<tokio::task::JoinHandle<()>> = None;
-        let mut recovery = tokio::time::interval(Duration::from_secs(10));
+        let mut recovery = tokio::time::interval(recovery_poll);
         recovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             if *cancel_rx.borrow() {
@@ -149,7 +150,7 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
                         let rpc = execution_rpc.clone();
                         let tx = settlement_tx.clone();
                         settlement_task = Some(tokio::spawn(async move {
-                            let response = crate::submission::fetch_settlement(&rpc, job, SETTLEMENT_TIMEOUT).await;
+                            let response = crate::submission::fetch_settlement(&rpc, job, settlement_timeout).await;
                             let _ = tx.send(response).await;
                         }));
                     }
@@ -208,7 +209,7 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
             endpoint: config.grpc_url.clone(),
             token: config.grpc_x_token.clone(),
             global_config: lastbuy_sdk::pda::derive_global_config().0.to_string(),
-            idle_timeout: Duration::from_secs(30),
+            idle_timeout: grpc_idle_timeout,
             replay_overlap: 32,
         },
         tx,
@@ -217,8 +218,8 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
     ));
     let mut scheduler = Scheduler::new_with_failure_limit(
         CAPACITY,
-        Duration::from_secs(2),
-        Duration::from_secs(60),
+        retry_initial,
+        retry_max,
         config.max_curve_failures,
     );
     scheduler.restore_exhausted(restored_exhausted);
@@ -363,7 +364,10 @@ pub async fn run(config: Config) -> Result<(), RuntimeError> {
             let rpc = rpc.clone();
             let slot = last_slot;
             work = Some(tokio::spawn(async move {
-                WorkResult::Scan(token, reconcile::scan(&rpc, Some(slot), RPC_TIMEOUT).await)
+                WorkResult::Scan(
+                    token,
+                    reconcile::scan(&rpc, Some(slot), rpc_timeout, request_spacing).await,
+                )
             }));
         }
     };

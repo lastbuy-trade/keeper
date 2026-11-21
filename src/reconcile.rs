@@ -281,17 +281,18 @@ fn scan_params(
     serde_json::json!([PROGRAM_ID.to_string(), config])
 }
 
-pub(crate) const RPC_REQUEST_SPACING: Duration = Duration::from_millis(100);
-
 /// Two independent context-bearing confirmed scans. All accounts are validated before either
 /// snapshot is returned; callers must treat any error as degraded discovery and retry with backoff.
 pub async fn scan(
     client: &RpcClient,
     min_context_slot: Option<u64>,
     timeout: Duration,
+    request_spacing: Duration,
 ) -> Result<[Snapshot<CurveState>; 2], ScanError> {
     let graduated = scan_status(client, 4, min_context_slot, timeout).await?;
-    tokio::time::sleep(RPC_REQUEST_SPACING).await;
+    if !request_spacing.is_zero() {
+        tokio::time::sleep(request_spacing).await;
+    }
     let migrating = scan_status(client, 5, min_context_slot, timeout).await?;
     Ok([graduated, migrating])
 }

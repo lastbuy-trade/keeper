@@ -1,0 +1,10 @@
+# Optional overrides. Copy beside keeper.toml as keeper.advanced.toml.
+# Omitted timing keys use their defaults.
+# Runtime timeout bounds: positive seconds, at most 31,536,000 (one year).
+# rpc_timeout_seconds = 900 # Outer deadline includes provider retry delays; lowering it may interrupt retries.
+# settlement_timeout_seconds = 150
+# pending_recovery_poll_seconds = 10 # Recovery checks and accounting work start cadence.
+# gpa_request_spacing_ms = 100 # Zero is allowed; otherwise at most 31,536,000,000 ms (one year).
+# grpc_slot_idle_timeout_seconds = 30 # Also bounds gRPC connection and subscription setup.
+# scheduler_retry_initial_seconds = 2
+# scheduler_retry_max_seconds = 60 # Must be at least the initial retry delay.
