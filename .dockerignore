@@ -1,0 +1,8 @@
+*
+!Cargo.toml
+!Cargo.lock
+!LICENSE
+!src/
+!src/**
+!keeper.example.toml
+!keeper.secrets.example.toml
