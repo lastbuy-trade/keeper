@@ -45,3 +45,28 @@ Use `keeper reset-ledger --config keeper.toml` to permanently remove the active 
 ## Advanced setup
 
 Advanced settings can be configured in optional `keeper.advanced.toml`. Create it by copying `keeper.advanced.example.toml`; `keeper init` does not make it. `run` and `check` use it.
+
+## Docker
+
+Build the image with Docker. The image runs as an unprivileged user and defaults to `keeper --help`.
+
+```sh
+docker build -t lastbuy-keeper .
+mkdir -p config state
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/config:/config" lastbuy-keeper init
+```
+
+Edit `config/keeper.toml` and `config/keeper.secrets.toml` with your endpoint settings. The image reads the keypair from `/run/keeper/id.json` and stores its ledger in `/state`. Keep the funded keypair outside the image; this mounts it read-only and persists the ledger in `state/`:
+
+```sh
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --mount "type=bind,src=$PWD/config,dst=/config,readonly" \
+  --mount "type=bind,src=$PWD/state,dst=/state" \
+  --mount "type=bind,src=$HOME/.config/solana/id.json,dst=/run/keeper/id.json,readonly" \
+  lastbuy-keeper run
+```
+
+Use the same command with `check` or `profit` in place of `run` to check connectivity or view accounting. Running with your host UID/GID lets the process read private host files and keeps ledger files owned by your host user. Credentials stay in the mounted private secrets file, not image layers or command arguments.
+
+If your validator runs on the Docker Desktop host, replace `localhost` with `host.docker.internal` in the endpoint URLs. `keeper check` was verified with `http://host.docker.internal:8899` for JSON-RPC and `http://host.docker.internal:10000` for Yellowstone gRPC.
